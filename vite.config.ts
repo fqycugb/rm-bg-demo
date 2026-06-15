@@ -2,16 +2,11 @@ import { defineConfig } from 'vite'
 
 export default defineConfig({
   base: './',
-  server: {
-    headers: {
-      'Cross-Origin-Opener-Policy': 'same-origin',
-      'Cross-Origin-Embedder-Policy': 'require-corp',
-    },
+  build: {
+    target: 'es2022',
+    chunkSizeWarningLimit: 2000,
   },
-  preview: {
-    headers: {
-      'Cross-Origin-Opener-Policy': 'same-origin',
-      'Cross-Origin-Embedder-Policy': 'require-corp',
-    },
+  optimizeDeps: {
+    exclude: ['@huggingface/transformers'],
   },
 })
