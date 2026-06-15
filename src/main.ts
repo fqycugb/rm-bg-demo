@@ -1,8 +1,10 @@
 import './style.css'
-import { removeBackground } from '@imgly/background-removal'
-import type { Config } from '@imgly/background-removal'
+import { env, pipeline } from '@huggingface/transformers'
+import type { ProgressInfo } from '@huggingface/transformers'
 
-type ModelId = Config['model']
+env.allowLocalModels = false
+
+type Segmenter = (image: string) => Promise<Array<{ toBlob: () => Promise<Blob> }>>
 
 const app = document.querySelector<HTMLDivElement>('#app')!
 
@@ -10,7 +12,7 @@ app.innerHTML = `
   <main class="container">
     <header class="header">
       <h1>图片去背景</h1>
-      <p class="subtitle">基于 @imgly/background-removal，在浏览器本地完成 AI 抠图</p>
+      <p class="subtitle">基于 Transformers.js + MODNet，在浏览器本地完成 AI 抠图（Apache-2.0）</p>
     </header>
 
     <section class="card upload-card">
@@ -18,18 +20,10 @@ app.innerHTML = `
         <input id="file-input" type="file" accept="image/*" hidden />
         <div class="dropzone-icon">↑</div>
         <p class="dropzone-title">拖拽图片到此处，或点击选择</p>
-        <p class="dropzone-hint">支持 JPG、PNG、WebP 等常见格式</p>
+        <p class="dropzone-hint">支持 JPG、PNG、WebP 等常见格式 · 人像抠图效果最佳</p>
       </div>
 
       <div class="controls">
-        <label class="field">
-          <span>模型</span>
-          <select id="model-select">
-            <option value="isnet_fp16" selected>标准 (约 80MB，推荐)</option>
-            <option value="isnet_quint8">轻量 (约 40MB，速度更快)</option>
-            <option value="isnet">高精度 (体积更大)</option>
-          </select>
-        </label>
         <button id="process-btn" type="button" class="btn" disabled>开始去背景</button>
       </div>
     </section>
@@ -72,7 +66,6 @@ app.innerHTML = `
 
 const dropzone = document.querySelector<HTMLDivElement>('#dropzone')!
 const fileInput = document.querySelector<HTMLInputElement>('#file-input')!
-const modelSelect = document.querySelector<HTMLSelectElement>('#model-select')!
 const processBtn = document.querySelector<HTMLButtonElement>('#process-btn')!
 const statusPanel = document.querySelector<HTMLElement>('#status-panel')!
 const statusText = document.querySelector<HTMLElement>('#status-text')!
@@ -90,18 +83,42 @@ let originalUrl: string | null = null
 let resultUrl: string | null = null
 let resultBlob: Blob | null = null
 let processing = false
+let segmenterPromise: Promise<Segmenter> | null = null
 
 function revokeUrl(url: string | null) {
   if (url) URL.revokeObjectURL(url)
 }
 
-function setProgress(current: number, total: number, label: string) {
-  const ratio = total > 0 ? Math.min(current / total, 1) : 0
-  const percent = Math.round(ratio * 100)
-
-  progressBar.style.width = `${percent}%`
-  statusPercent.textContent = `${percent}%`
+function setProgress(percent: number, label: string, detail?: string) {
+  const clamped = Math.min(Math.max(percent, 0), 100)
+  progressBar.style.width = `${clamped}%`
+  statusPercent.textContent = `${Math.round(clamped)}%`
   statusText.textContent = label
+  if (detail) statusDetail.textContent = detail
+}
+
+function handleModelProgress(info: ProgressInfo) {
+  if (info.status === 'progress' && 'progress' in info) {
+    setProgress(info.progress, '正在下载模型资源…', info.file)
+    return
+  }
+  if (info.status === 'done' && info.file) {
+    statusDetail.textContent = `已加载 ${info.file}`
+  }
+}
+
+function getSegmenter(): Promise<Segmenter> {
+  if (!segmenterPromise) {
+    segmenterPromise = (async () => {
+      const model = await pipeline('background-removal', 'Xenova/modnet', {
+        dtype: 'fp32',
+        device: 'gpu' in navigator ? 'webgpu' : 'wasm',
+        progress_callback: handleModelProgress,
+      })
+      return model as unknown as Segmenter
+    })()
+  }
+  return segmenterPromise
 }
 
 function showStatus(label: string, detail: string) {
@@ -160,23 +177,16 @@ async function processImage() {
 
   showStatus('正在处理', '首次运行会下载模型文件，之后会自动缓存')
 
-  const model = modelSelect.value as ModelId
-  const config: Config = {
-    model,
-    progress: (key, current, total) => {
-      const isModelDownload = key.includes('fetch') || key.includes('download') || key.includes('onnx') || key.includes('wasm')
-      setProgress(
-        current,
-        total,
-        isModelDownload ? '正在下载模型资源…' : '正在 AI 抠图…',
-      )
-      statusDetail.textContent = key
-    },
-  }
+  const inferenceUrl = URL.createObjectURL(selectedFile)
 
   try {
-    setProgress(0, 1, '正在初始化…')
-    const blob = await removeBackground(selectedFile, config)
+    setProgress(0, '正在初始化…', '加载 Transformers.js 模型')
+    const segmenter = await getSegmenter()
+
+    setProgress(100, '正在 AI 抠图…', 'Xenova/modnet')
+    const output = await segmenter(inferenceUrl)
+    const blob = await output[0].toBlob()
+
     resultBlob = blob
     resultUrl = URL.createObjectURL(blob)
     resultImg.src = resultUrl
@@ -187,6 +197,7 @@ async function processImage() {
     showStatus('处理失败', error instanceof Error ? error.message : '未知错误，请重试')
     processBtn.disabled = false
   } finally {
+    URL.revokeObjectURL(inferenceUrl)
     processing = false
     if (selectedFile && !resultBlob) {
       processBtn.disabled = false
